@@ -1,4 +1,4 @@
-# Streamlit 기반 LSTM 주가 예측 대시보드 (OpenDART 기업코드 API 적용 + 네이버 코드 변환)
+# Streamlit 기반 LSTM 주가 예측 대시보드 (수정본: 예측값 표 추가)
 
 import streamlit as st
 import numpy as np
@@ -22,9 +22,10 @@ SEED = 42
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
+st.set_page_config(page_title="LSTM 주가 예측", layout="wide") # 화면을 넓게 사용
 st.title("📈 LSTM 기반 주가 예측 대시보드")
 
-# 🔐 OpenDART API KEY
+# 🔐 OpenDART API KEY (주의: 보안을 위해 나중에 Streamlit Secrets 등을 사용하는 것이 좋습니다)
 DART_API_KEY = 'ea6f080a6e93838fee1467220df5cbdccce35ecc'
 
 @st.cache_data(show_spinner=False)
@@ -65,16 +66,13 @@ selected_row = st.selectbox("📌 예측할 종목을 선택하세요:", matched
 selected_name, code = selected_row.split(' (')
 code = code.rstrip(')')
 
-# 네이버용 코드 (종목코드 + .KS or .KQ)
-if code.startswith('0') or code.startswith('1'):
-    naver_code = code + ""
-else:
-    naver_code = code
+# 네이버용 코드 설정
+naver_code = code
 
-# LSTM 설정
+# LSTM 설정 (사이드바)
 st.sidebar.header("⚙️ LSTM 모델 설정")
 lookback_days = st.sidebar.slider("과거 입력일 수 (lookback days)", 30, 180, 120, 10)
-predict_days = st.sidebar.slider("미래 예측일 수 (predict days)", 30, 180, 120, 10)
+predict_days = st.sidebar.slider("미래 예측일 수 (predict days)", 30, 180, 30, 10) # 기본값을 30일로 조정
 compare_days = st.sidebar.slider("과거 예측 정확도 비교일 수", 30, 180, 90, 10)
 epochs = st.sidebar.slider("에포크 수 (학습 반복 수)", 5, 100, 10, 5)
 batch_size = st.sidebar.slider("배치 크기", 8, 128, 32, 8)
@@ -103,7 +101,7 @@ def get_naver_data(code, max_pages=30):
     df.sort_index(inplace=True)
     return df
 
-st.write("### 📅 네이버 금융에서 데이터 로딩 중...")
+st.write(f"### 📅 {selected_name}({code}) 데이터 로딩 및 모델 학습 중...")
 try:
     data = get_naver_data(naver_code)
     if data.empty or len(data) < 150:
@@ -112,7 +110,7 @@ except Exception as e:
     st.error(f"❌ 종목 데이터를 불러올 수 없습니다. 선택한 코드: {code}\n\n오류 내용: {e}")
     st.stop()
 
-# 전처리 및 시퀀스 구성
+# 데이터 전처리
 scaler = MinMaxScaler()
 scaled_data = scaler.fit_transform(data)
 
@@ -125,7 +123,7 @@ def create_sequences(data, seq_len):
 
 X, y = create_sequences(scaled_data, lookback_days)
 
-# 모델
+# 모델 구성 및 학습
 model = Sequential([
     LSTM(50, input_shape=(lookback_days, 1)),
     Dense(1)
@@ -133,22 +131,23 @@ model = Sequential([
 model.compile(optimizer='adam', loss='mse')
 model.fit(X, y, epochs=epochs, batch_size=batch_size, verbose=0)
 
-# 예측
+# 과거 정확도 검증 예측
 x_recent = X[-compare_days:]
-past_pred = scaler.inverse_transform(model.predict(x_recent))
+past_pred = scaler.inverse_transform(model.predict(x_recent, verbose=0))
 actual_recent = scaler.inverse_transform(y[-compare_days:])
 dates_past = data.index[-compare_days:]
 
 rmse = np.sqrt(mean_squared_error(actual_recent, past_pred))
 mae = mean_absolute_error(actual_recent, past_pred)
 
-st.subheader("📊 예측 정확도 (과거 예측 비교 기준)")
-st.markdown(f"- **RMSE**: `{rmse:,.2f}`  |  **MAE**: `{mae:,.2f}`")
+st.subheader("📊 예측 정확도 (과거 데이터 비교)")
+st.markdown(f"- **RMSE(평균 제곱근 오차)**: `{rmse:,.2f}`  |  **MAE(평균 절대 오차)**: `{mae:,.2f}`")
 
-# 미래 예측
+# 미래 주가 예측
 future_input = scaled_data[-lookback_days:]
 future_pred_scaled = []
 current_input = future_input.copy()
+
 for _ in range(predict_days):
     pred = model.predict(current_input.reshape(1, lookback_days, 1), verbose=0)
     pred_val = pred[0][0]
@@ -158,6 +157,7 @@ for _ in range(predict_days):
 future_pred = scaler.inverse_transform(future_pred_scaled)
 dates_future = pd.date_range(start=data.index[-1] + timedelta(days=1), periods=predict_days)
 
+# 📈 그래프 출력
 fig, ax = plt.subplots(figsize=(14, 6))
 ax.plot(dates_past, actual_recent, label='Actual (Past)', color='blue')
 ax.plot(dates_past, past_pred, label='Predicted (Past)', color='orange')
@@ -168,11 +168,31 @@ ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
 ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f'{int(x):,}'))
 ax.set_title(f'Stock Price Forecast with LSTM: {selected_name} ({code})')
 ax.set_xlabel('Date')
-ax.set_ylabel('Price')
+ax.set_ylabel('Price (KRW)')
 ax.legend()
 ax.grid(True)
 plt.xticks(rotation=45)
 plt.tight_layout()
 st.pyplot(fig)
 
-st.success("✔️ 예측이 완료되었습니다. 그래프와 지표를 확인하세요!")
+# 📋 [새로 추가된 항목] 예측값 상세 표 출력
+st.subheader(f"🔮 향후 {predict_days}일간 예측값 상세")
+df_future = pd.DataFrame({
+    '날짜': dates_future.strftime('%Y-%m-%d'),
+    '예측가(원)': future_pred.flatten().astype(int)
+})
+df_future.index = range(1, len(df_future) + 1) # 인덱스를 1부터 시작하도록 설정
+
+col1, col2 = st.columns([1, 2])
+with col1:
+    # 천 단위 콤마 포맷팅 적용하여 표시
+    st.dataframe(df_future.style.format({'예측가(원)': '{:,}'}), use_container_width=True)
+with col2:
+    st.info("""
+    **표 활용 팁:**
+    - 마우스를 표에 올리면 오른쪽 상단에 다운로드 아이콘이 나타납니다 (CSV 저장 가능).
+    - 각 컬럼 제목을 클릭하여 오름차순/내림차순으로 정렬할 수 있습니다.
+    - LSTM 모델의 특성상 미래로 갈수록 오차가 커질 수 있으므로 투자 참고용으로만 활용하세요.
+    """)
+
+st.success("✔️ 모든 분석 및 예측이 완료되었습니다!")
