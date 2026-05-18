@@ -5,5 +5,5 @@ streamlit>=1.30
 pandas>=2.0
 matplotlib>=3.7
 requests>=2.31
-FinanceDataReader>=0.9.90
+git+https://github.com/FinanceData/FinanceDataReader.git
 psutil>=5.9
