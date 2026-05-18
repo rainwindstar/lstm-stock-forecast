@@ -1,4 +1,4 @@
-tensorflow>=2.15
+tensorflow-cpu>=2.15
 scikit-learn>=1.3
 streamlit>=1.30
 pandas>=2.0
@@ -9,5 +9,4 @@ lxml>=4.9
 requests>=2.31
 FinanceDataReader>=0.9.90
 psutil>=5.9
-pyngrok>=7.1
 openpyxl>=3.1
