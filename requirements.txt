@@ -7,3 +7,6 @@ matplotlib>=3.7
 requests>=2.31
 git+https://github.com/FinanceData/FinanceDataReader.git
 psutil>=5.9
+koreanize-matplotlib>=0.1.1
+gspread>=6.0
+google-auth>=2.29

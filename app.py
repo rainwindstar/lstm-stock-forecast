@@ -1,7 +1,7 @@
 # LSTM 주가 예측 대시보드 v4.1 — 전면 UI 리디자인
 # 가격 기술지표 + 거시경제(환율·VIX·KOSPI) + DART 재무 통합 멀티피처 모델
 
-import warnings, os
+import warnings, os, json
 warnings.filterwarnings("ignore")
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"]  = "3"
@@ -13,7 +13,11 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.ticker as ticker
 import matplotlib
-matplotlib.rcParams['font.family'] = 'Malgun Gothic'
+try:
+    import koreanize_matplotlib  # Streamlit Cloud/Linux에서 Matplotlib 한글 폰트 보강
+except Exception:
+    koreanize_matplotlib = None
+matplotlib.rcParams['font.family'] = ['NanumGothic', 'Malgun Gothic', 'AppleGothic', 'DejaVu Sans']
 matplotlib.rcParams['axes.unicode_minus'] = False
 
 import FinanceDataReader as fdr
@@ -28,11 +32,24 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except Exception:
+    gspread = None
+    Credentials = None
+
 SEED = 42
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 APP_DIR = Path(__file__).resolve().parent
+WORKSPACE_DIR = APP_DIR.parents[1]
 LOCAL_CORPCODE_XML = APP_DIR / "CORPCODE.xml"
+LOCAL_ENV_PATHS = [
+    APP_DIR / ".env",
+    WORKSPACE_DIR / ".env",
+    WORKSPACE_DIR / "00_영웅문" / ".env",
+]
 DEFAULT_STOCKS = pd.DataFrame([
     {"회사명": "삼성전자", "종목코드": "005930", "corp_code": ""},
     {"회사명": "SK하이닉스", "종목코드": "000660", "corp_code": ""},
@@ -43,6 +60,24 @@ DEFAULT_STOCKS = pd.DataFrame([
 ])
 
 
+def load_local_env():
+    for env_path in LOCAL_ENV_PATHS:
+        if not env_path.exists():
+            continue
+        try:
+            for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and value and key not in os.environ:
+                    os.environ[key] = value
+        except Exception:
+            pass
+
+
 def _secret(name):
     try:
         return str(st.secrets.get(name, "")).strip()
@@ -50,12 +85,24 @@ def _secret(name):
         return ""
 
 
+def _truthy(value):
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+load_local_env()
+
 DART_API_KEY = (
     os.getenv("DART_API_KEY", "").strip()
     or os.getenv("OPENDART_API_KEY", "").strip()
     or _secret("DART_API_KEY")
     or _secret("OPENDART_API_KEY")
 )
+ECOS_API_KEY = os.getenv("ECOS_API_KEY", "").strip() or _secret("ECOS_API_KEY")
+KRX_API_KEY = os.getenv("KRX_API_KEY", "").strip() or _secret("KRX_API_KEY")
+PUBLIC_DATA_API_KEY = os.getenv("PUBLIC_DATA_API_KEY", "").strip() or _secret("PUBLIC_DATA_API_KEY")
+GOOGLE_SHEET_FOLDER_ID = os.getenv("GOOGLE_SHEET_FOLDER_ID", "").strip() or _secret("GOOGLE_SHEET_FOLDER_ID")
+GOOGLE_SHEET_SHARE_EMAIL = os.getenv("GOOGLE_SHEET_SHARE_EMAIL", "").strip() or _secret("GOOGLE_SHEET_SHARE_EMAIL")
+GOOGLE_SHEETS_AUTO_SAVE_DEFAULT = _truthy(os.getenv("GOOGLE_SHEETS_AUTO_SAVE", _secret("GOOGLE_SHEETS_AUTO_SAVE")))
 
 # ══════════════════════════════════════════════════════════
 #  페이지 설정 & CSS
@@ -64,6 +111,10 @@ st.set_page_config(page_title="LSTM 주가 예측", page_icon="📈", layout="wi
 
 st.markdown("""
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;600;700;800&display=swap');
+html, body, [class*="css"], .stApp, .stMarkdown, .stDataFrame, .stSelectbox, .stTextInput, .stButton {
+    font-family: 'Noto Sans KR', 'NanumGothic', 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif !important;
+}
 /* ── 섹션 헤더 ───────────────────── */
 .sec-header {
     font-size: 13px; font-weight: 700; letter-spacing: 1.2px;
@@ -182,6 +233,181 @@ def section(title, icon=""):
     st.markdown(f'<div class="sec-header">{icon} {title}</div>', unsafe_allow_html=True)
 
 
+class GoogleSheetsConfigError(Exception):
+    pass
+
+
+PREDICTION_HEADERS = [
+    "검색일시", "검색일자", "종목명", "종목코드", "기준일", "예측일",
+    "예측종가", "예측전일대비", "예측등락률(%)", "실제종가", "오차", "오차율(%)",
+    "lookback", "예측일수", "epochs", "batch", "검증RMSE", "검증MAE",
+    "검증MAPE", "방향정확도(%)", "피처수", "피처목록",
+]
+
+
+def _sheet_safe_title(value, max_len=80):
+    invalid_chars = '[]:*?/\\'
+    cleaned = "".join(ch for ch in str(value) if ch not in invalid_chars).strip()
+    return cleaned[:max_len] or "LSTM_주가예측"
+
+
+def _number_or_blank(value, digits=None):
+    if value is None or pd.isna(value):
+        return ""
+    num = float(value)
+    if digits is not None:
+        num = round(num, digits)
+    return int(num) if float(num).is_integer() else num
+
+
+def _load_service_account_info():
+    for secret_name in ("gcp_service_account", "google_service_account"):
+        try:
+            value = st.secrets.get(secret_name)
+            if value:
+                return dict(value)
+        except Exception:
+            pass
+    raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip() or _secret("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if raw:
+        if raw.startswith("{"):
+            return json.loads(raw)
+        json_path = Path(raw)
+        if json_path.exists():
+            return json.loads(json_path.read_text(encoding="utf-8"))
+    raise GoogleSheetsConfigError(
+        "Google 서비스 계정 정보가 없습니다. Streamlit secrets의 [gcp_service_account] 또는 "
+        "GOOGLE_SERVICE_ACCOUNT_JSON 환경변수를 설정해 주세요."
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def get_google_sheets_client():
+    if gspread is None or Credentials is None:
+        raise GoogleSheetsConfigError(
+            "gspread/google-auth 패키지가 설치되어 있지 않습니다. requirements.txt 반영 후 재배포해 주세요."
+        )
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(_load_service_account_info(), scopes=scopes)
+    return gspread.authorize(creds)
+
+
+def open_or_create_prediction_spreadsheet(client, title):
+    try:
+        return client.open(title), False
+    except Exception:
+        try:
+            spreadsheet = client.create(title, folder_id=GOOGLE_SHEET_FOLDER_ID or None)
+        except TypeError:
+            spreadsheet = client.create(title)
+        if GOOGLE_SHEET_SHARE_EMAIL:
+            spreadsheet.share(GOOGLE_SHEET_SHARE_EMAIL, perm_type="user", role="writer")
+        return spreadsheet, True
+
+
+def get_or_create_prediction_worksheet(spreadsheet):
+    try:
+        ws = spreadsheet.worksheet("예측기록")
+    except Exception:
+        ws = spreadsheet.add_worksheet(title="예측기록", rows=1000, cols=len(PREDICTION_HEADERS))
+        ws.update(values=[PREDICTION_HEADERS], range_name="A1")
+        ws.freeze(rows=1)
+    values = ws.get_all_values()
+    if not values or values[0] != PREDICTION_HEADERS:
+        ws.update(values=[PREDICTION_HEADERS], range_name="A1")
+    return ws
+
+
+def build_prediction_sheet_rows(pred_table, stock_name, stock_code, base_date, close_by_date, metrics, model_settings, features):
+    searched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    searched_date = searched_at[:10]
+    rows = []
+    for _, row in pred_table.iterrows():
+        forecast_date = str(row["날짜"])
+        predicted_close = _number_or_blank(row["예측 종가"])
+        actual_close = close_by_date.get(forecast_date, "")
+        error = ""
+        error_pct = ""
+        if actual_close != "" and predicted_close != "":
+            error = float(actual_close) - float(predicted_close)
+            error_pct = error / float(predicted_close) * 100 if float(predicted_close) else ""
+        rows.append([
+            searched_at, searched_date, stock_name, stock_code, base_date, forecast_date,
+            predicted_close, _number_or_blank(row["전일대비"]), _number_or_blank(row["등락률(%)"], 2),
+            _number_or_blank(actual_close), _number_or_blank(error), _number_or_blank(error_pct, 2),
+            model_settings["lookback"], model_settings["pred_days"], model_settings["epochs"], model_settings["batch"],
+            _number_or_blank(metrics["rmse"]), _number_or_blank(metrics["mae"]), _number_or_blank(metrics["mape"], 2),
+            _number_or_blank(metrics["direction_accuracy"], 2), len(features), ", ".join(features),
+        ])
+    return rows
+
+
+def refresh_actual_prices(values, stock_code, close_by_date):
+    if not values:
+        return values, 0
+    headers = values[0]
+    rows = values[1:]
+    idx = {name: i for i, name in enumerate(headers)}
+    required = ["종목코드", "예측일", "예측종가", "실제종가", "오차", "오차율(%)"]
+    if any(col not in idx for col in required):
+        return values, 0
+    changed = 0
+    for row in rows:
+        while len(row) < len(headers):
+            row.append("")
+        if row[idx["종목코드"]] != stock_code:
+            continue
+        forecast_date = row[idx["예측일"]]
+        actual = close_by_date.get(forecast_date)
+        if actual in (None, ""):
+            continue
+        predicted = row[idx["예측종가"]]
+        try:
+            predicted_num = float(str(predicted).replace(",", ""))
+            actual_num = float(actual)
+        except Exception:
+            continue
+        error = actual_num - predicted_num
+        error_pct = error / predicted_num * 100 if predicted_num else ""
+        new_values = [str(int(actual_num)), str(int(error)), f"{error_pct:.2f}" if error_pct != "" else ""]
+        target_cols = ["실제종가", "오차", "오차율(%)"]
+        if any(row[idx[col]] != val for col, val in zip(target_cols, new_values)):
+            for col, val in zip(target_cols, new_values):
+                row[idx[col]] = val
+            changed += 1
+    return [headers] + rows, changed
+
+
+def save_prediction_to_google_sheets(title, rows, stock_code, close_by_date):
+    client = get_google_sheets_client()
+    spreadsheet, created = open_or_create_prediction_spreadsheet(client, title)
+    ws = get_or_create_prediction_worksheet(spreadsheet)
+    values = ws.get_all_values()
+    if not values:
+        values = [PREDICTION_HEADERS]
+    if values[0] != PREDICTION_HEADERS:
+        values[0] = PREDICTION_HEADERS
+    values, refreshed = refresh_actual_prices(values, stock_code, close_by_date)
+    existing_rows = values[1:]
+    key_cols = ["검색일자", "종목코드", "예측일"]
+    idx = {name: i for i, name in enumerate(PREDICTION_HEADERS)}
+    row_map = {tuple(row[idx[col]] for col in key_cols): i for i, row in enumerate(existing_rows) if len(row) >= len(PREDICTION_HEADERS)}
+    upserted = 0
+    for row in rows:
+        row = ["" if value is None else value for value in row]
+        key = tuple(str(row[idx[col]]) for col in key_cols)
+        if key in row_map:
+            existing_rows[row_map[key]] = row
+        else:
+            row_map[key] = len(existing_rows)
+            existing_rows.append(row)
+        upserted += 1
+    ws.clear()
+    ws.update(values=[PREDICTION_HEADERS] + existing_rows, range_name="A1", value_input_option="USER_ENTERED")
+    ws.freeze(rows=1)
+    return spreadsheet.url, upserted, refreshed, created
+
+
 # ══════════════════════════════════════════════════════════
 #  데이터 함수
 # ══════════════════════════════════════════════════════════
@@ -245,19 +471,159 @@ def get_price_data(code, years=3):
     return df.dropna().sort_index()
 
 
+def _safe_float(value):
+    try:
+        return float(str(value).replace(",", ""))
+    except Exception:
+        return np.nan
+
+
+def _ecos_period_bounds(period, s, e):
+    start = pd.Timestamp(s)
+    end = pd.Timestamp(e)
+    if period == "M":
+        return start.strftime("%Y%m"), end.strftime("%Y%m")
+    return start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
-def get_macro_data(s, e):
+def get_ecos_series(stat, period, item, s, e, api_key):
+    if not api_key:
+        return pd.Series(dtype="float64")
+    start, end = _ecos_period_bounds(period, s, e)
+    url = f"https://ecos.bok.or.kr/api/StatisticSearch/{api_key}/json/kr/1/10000/{stat}/{period}/{start}/{end}/{item}"
+    try:
+        data = requests.get(url, timeout=15).json()
+        rows = data.get("StatisticSearch", {}).get("row", [])
+        if not rows:
+            return pd.Series(dtype="float64")
+        values = []
+        for row in rows:
+            raw_date = str(row.get("TIME", ""))
+            date_format = "%Y%m" if period == "M" else "%Y%m%d"
+            date = pd.to_datetime(raw_date, format=date_format, errors="coerce")
+            value = _safe_float(row.get("DATA_VALUE"))
+            if pd.notna(date) and pd.notna(value):
+                values.append((date, value))
+        if not values:
+            return pd.Series(dtype="float64")
+        return pd.Series(dict(values)).sort_index().astype(float)
+    except Exception:
+        return pd.Series(dtype="float64")
+
+
+def _fdr_close(ticker, s, e):
+    try:
+        df = fdr.DataReader(ticker, s, e)
+        if df.empty:
+            return pd.Series(dtype="float64")
+        close_col = "Close" if "Close" in df.columns else df.columns[0]
+        series = df[close_col].copy()
+        series.index = pd.to_datetime(series.index)
+        return pd.to_numeric(series, errors="coerce").dropna().sort_index()
+    except Exception:
+        return pd.Series(dtype="float64")
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_naver_index_close(index_code, s, e, pages=80):
     frames = []
-    for col, ticker in [('usdkrw','USD/KRW'),('vix','^VIX'),('kospi','KS11')]:
-        try:
-            tmp = fdr.DataReader(ticker, s, e)
-            cc  = 'Close' if 'Close' in tmp.columns else tmp.columns[0]
-            frames.append(tmp[[cc]].rename(columns={cc: col}))
-        except Exception:
-            pass
-    if not frames:
-        return pd.DataFrame()
-    macro = pd.concat(frames, axis=1).ffill()
+    headers = {"User-Agent": "Mozilla/5.0"}
+    url = "https://finance.naver.com/sise/sise_index_day.naver"
+    start = pd.Timestamp(s)
+    end = pd.Timestamp(e)
+    try:
+        for page in range(1, pages + 1):
+            response = requests.get(
+                url,
+                params={"code": index_code, "page": page},
+                headers=headers,
+                timeout=12,
+            )
+            response.raise_for_status()
+            table = pd.read_html(io.StringIO(response.text))[0].dropna()
+            if table.empty:
+                continue
+            table = table.iloc[:, :6]
+            table.columns = ["date", "close", "change", "open", "high", "low"]
+            frames.append(table[["date", "close"]])
+
+        if not frames:
+            return pd.Series(dtype="float64")
+        df = pd.concat(frames, ignore_index=True)
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["close"] = pd.to_numeric(
+            df["close"].astype(str).str.replace(",", "", regex=False),
+            errors="coerce",
+        )
+        df = (
+            df.dropna(subset=["date", "close"])
+            .drop_duplicates("date")
+            .sort_values("date")
+            .set_index("date")
+        )
+        df = df[(df.index >= start) & (df.index <= end)]
+        return df["close"].astype(float)
+    except Exception:
+        return pd.Series(dtype="float64")
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_macro_bundle(s, e, ecos_api_key):
+    series_map = {}
+    source_map = {}
+
+    usdkrw_ecos = get_ecos_series("731Y001", "D", "0000001", s, e, ecos_api_key)
+    if not usdkrw_ecos.empty:
+        series_map["usdkrw"] = usdkrw_ecos
+        source_map["usdkrw"] = "ECOS"
+    else:
+        usdkrw_fdr = _fdr_close("USD/KRW", s, e)
+        if not usdkrw_fdr.empty:
+            series_map["usdkrw"] = usdkrw_fdr
+            source_map["usdkrw"] = "FDR"
+
+    vix = _fdr_close("^VIX", s, e)
+    if not vix.empty:
+        series_map["vix"] = vix
+        source_map["vix"] = "FDR"
+
+    kospi = get_naver_index_close("KOSPI", s, e)
+    if not kospi.empty:
+        series_map["kospi"] = kospi
+        source_map["kospi"] = "Naver"
+    else:
+        kospi = _fdr_close("KS11", s, e)
+        if not kospi.empty:
+            series_map["kospi"] = kospi
+            source_map["kospi"] = "FDR"
+
+    kosdaq = get_naver_index_close("KOSDAQ", s, e)
+    if not kosdaq.empty:
+        series_map["kosdaq"] = kosdaq
+        source_map["kosdaq"] = "Naver"
+
+    ecos_extra_specs = {
+        "base_rate": ("722Y001", "M", "0101000", "기준금리", "%"),
+        "bond_3y": ("817Y002", "D", "010200000", "국채 3년", "%"),
+        "bond_10y": ("817Y002", "D", "010210000", "국채 10년", "%"),
+        "cpi": ("901Y009", "M", "0", "소비자물가", "%"),
+    }
+    ecos_extra = {}
+    for key, (stat, period, item, label, unit) in ecos_extra_specs.items():
+        series = get_ecos_series(stat, period, item, s, e, ecos_api_key)
+        if not series.empty:
+            ecos_extra[key] = {
+                "label": label,
+                "unit": unit,
+                "series": series,
+                "source": "ECOS",
+            }
+
+    if not series_map:
+        return pd.DataFrame(), {}, {}
+
+    macro = pd.concat(series_map, axis=1).ffill().bfill()
     macro.index = pd.to_datetime(macro.index)
     res = pd.DataFrame(index=macro.index)
     if 'usdkrw' in macro: res['환율변화']   = macro['usdkrw'].pct_change()
@@ -265,7 +631,68 @@ def get_macro_data(s, e):
         r = macro['vix'].rolling(60, min_periods=10)
         res['VIX정규화']  = (macro['vix'] - r.mean()) / (r.std() + 1e-9)
     if 'kospi'  in macro: res['KOSPI수익률'] = macro['kospi'].pct_change()
-    return res.ffill().bfill()
+    if 'kosdaq' in macro: res['KOSDAQ수익률'] = macro['kosdaq'].pct_change()
+
+    display = {}
+    if "usdkrw" in macro:
+        srs = macro["usdkrw"].dropna()
+        if len(srs) >= 2:
+            display["환율"] = {
+                "label": "USD/KRW 환율",
+                "value": float(srs.iloc[-1]),
+                "delta": float(srs.iloc[-1] - srs.iloc[-2]),
+                "rate": float((srs.iloc[-1] / srs.iloc[-2] - 1) * 100),
+                "unit": "원",
+                "source": source_map.get("usdkrw", ""),
+            }
+    if "vix" in macro:
+        srs = macro["vix"].dropna()
+        z = res["VIX정규화"].dropna() if "VIX정규화" in res else pd.Series(dtype=float)
+        if len(srs) >= 2 and not z.empty:
+            display["VIX"] = {
+                "label": "VIX 공포지수",
+                "value": float(srs.iloc[-1]),
+                "delta": float(srs.iloc[-1] - srs.iloc[-2]),
+                "zscore": float(z.iloc[-1]),
+                "unit": "",
+                "source": source_map.get("vix", ""),
+            }
+    if "kospi" in macro:
+        srs = macro["kospi"].dropna()
+        if len(srs) >= 2:
+            display["KOSPI"] = {
+                "label": "KOSPI",
+                "value": float(srs.iloc[-1]),
+                "delta": float(srs.iloc[-1] - srs.iloc[-2]),
+                "rate": float((srs.iloc[-1] / srs.iloc[-2] - 1) * 100),
+                "unit": "",
+                "source": source_map.get("kospi", ""),
+            }
+    if "kosdaq" in macro:
+        srs = macro["kosdaq"].dropna()
+        if len(srs) >= 2:
+            display["KOSDAQ"] = {
+                "label": "KOSDAQ",
+                "value": float(srs.iloc[-1]),
+                "delta": float(srs.iloc[-1] - srs.iloc[-2]),
+                "rate": float((srs.iloc[-1] / srs.iloc[-2] - 1) * 100),
+                "unit": "",
+                "source": source_map.get("kosdaq", ""),
+            }
+    for item in ecos_extra.values():
+        srs = item["series"].dropna()
+        if len(srs) >= 1:
+            key = item["label"]
+            prev = srs.iloc[-2] if len(srs) >= 2 else srs.iloc[-1]
+            display[key] = {
+                "label": item["label"],
+                "value": float(srs.iloc[-1]),
+                "delta": float(srs.iloc[-1] - prev),
+                "unit": item["unit"],
+                "source": item["source"],
+            }
+
+    return res.ffill().bfill(), display, source_map
 
 
 @st.cache_data(show_spinner=False, ttl=86400)
@@ -353,8 +780,27 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("🧩 추가 피처")
-    use_macro = st.toggle("🌐 거시경제 (환율·VIX·KOSPI)", value=True)
+    use_macro = st.toggle("🌐 거시경제 (ECOS·VIX·KOSPI·KOSDAQ)", value=True)
     use_dart  = st.toggle("📋 DART 재무 (영업이익률·YoY)", value=True)
+
+    st.markdown("---")
+    st.subheader("🔌 로컬 API")
+    api_rows = [
+        ("ECOS", ECOS_API_KEY),
+        ("DART", DART_API_KEY),
+        ("KRX", KRX_API_KEY),
+        ("공공데이터", PUBLIC_DATA_API_KEY),
+    ]
+    for api_name, api_key in api_rows:
+        st.caption(f"{'✅' if api_key else '⚪'} {api_name}: {'사용 가능' if api_key else '키 없음'}")
+    st.markdown("---")
+    st.subheader("Google Sheets 저장")
+    auto_save_sheets = st.toggle(
+        "예측 결과 자동 저장",
+        value=GOOGLE_SHEETS_AUTO_SAVE_DEFAULT,
+        help="설정된 Google 서비스 계정으로 LSTM_종목명_주가예측 시트에 검색일자 기준 저장/갱신합니다.",
+    )
+    save_sheets_now = st.button("현재 결과 저장/갱신", use_container_width=True)
 
     st.markdown("---")
     st.caption("EarlyStopping patience=15")
@@ -418,11 +864,11 @@ df = add_features(raw)
 ds, de = df.index[0].strftime('%Y-%m-%d'), df.index[-1].strftime('%Y-%m-%d')
 BASE_FEATURES = ['close','vol_log','ma5','ma20','rsi']
 extra_cols = []
-macro_status = {}; dart_status = {}
+macro_status = {}; macro_display = {}; dart_status = {}
 
 if use_macro:
     with st.spinner("🌐 거시경제 데이터 수집 중..."):
-        mdf = get_macro_data(ds, de)
+        mdf, macro_display, macro_sources = get_macro_bundle(ds, de, ECOS_API_KEY)
     if not mdf.empty:
         al    = mdf.reindex(df.index, method='ffill').ffill().bfill()
         valid = [c for c in al.columns if al[c].notna().sum() > lookback*2]
@@ -430,6 +876,8 @@ if use_macro:
             df = pd.concat([df, al[valid]], axis=1)
             extra_cols.extend(valid)
             macro_status = {c: float(al[c].iloc[-1]) for c in valid}
+    else:
+        st.warning("거시경제 데이터를 불러오지 못했습니다. ECOS/FDR 연결 상태를 확인해 주세요.")
 
 if use_dart and corp_code and DART_API_KEY:
     with st.spinner("📋 DART 재무 데이터 수집 중..."):
@@ -494,21 +942,63 @@ c5.markdown(kpi_card("MACD 방향", macd_dir,
 # ══════════════════════════════════════════════════════════
 #  KPI 패널 2: 거시경제 지표
 # ══════════════════════════════════════════════════════════
-if macro_status:
+if macro_display:
     section("거시경제 지표", "🌐")
-    icons = {'환율변화':'💱','VIX정규화':'😱','KOSPI수익률':'📊'}
-    helps = {
-        '환율변화':  '원/달러 일변화율. 양수=원화약세 → 외국인 매도 압력',
-        'VIX정규화': '공포지수 정규화. 높을수록 글로벌 리스크 고조',
-        'KOSPI수익률':'KOSPI 당일 수익률. 시장 전체 분위기',
+    icon_map = {
+        "환율": "💱",
+        "VIX": "😱",
+        "KOSPI": "📊",
+        "KOSDAQ": "📊",
+        "기준금리": "🏦",
+        "국채 3년": "📉",
+        "국채 10년": "📈",
+        "소비자물가": "🧾",
     }
-    mcols = st.columns(len(macro_status))
-    for col, (k, v) in zip(mcols, macro_status.items()):
-        sign = "▲" if v > 0 else "▼"
-        delta_str = f"{sign} {abs(v):.4f}"
-        col.markdown(kpi_card(f"{icons.get(k,'📌')} {k}", f"{v:+.4f}",
-                               delta_str, card="macro",
-                               help_txt=helps.get(k, '')), unsafe_allow_html=True)
+    help_map = {
+        "환율": "ECOS 우선, 실패 시 FDR. 원/달러 환율 원값과 전일 대비입니다.",
+        "VIX": "FDR. 글로벌 공포지수 원값과 최근 60거래일 기준 Z-score입니다.",
+        "KOSPI": "네이버 금융 우선, 실패 시 FDR. KOSPI 지수 원값과 전일 등락률입니다.",
+        "KOSDAQ": "네이버 금융. KOSDAQ 지수 원값과 전일 등락률입니다.",
+        "기준금리": "ECOS. 한국은행 기준금리 최신 월 자료입니다.",
+        "국채 3년": "ECOS. 국고채 3년 금리 최신 일 자료입니다.",
+        "국채 10년": "ECOS. 국고채 10년 금리 최신 일 자료입니다.",
+        "소비자물가": "ECOS. 소비자물가 지표 최신 월 자료입니다.",
+    }
+    ordered_keys = ["환율", "VIX", "KOSPI", "KOSDAQ", "기준금리", "국채 3년", "국채 10년", "소비자물가"]
+    display_items = [(k, macro_display[k]) for k in ordered_keys if k in macro_display]
+    for start in range(0, len(display_items), 4):
+        mcols = st.columns(min(4, len(display_items) - start))
+        for col, (k, item) in zip(mcols, display_items[start:start+4]):
+            source = item.get("source", "")
+            label = f"{icon_map.get(k, '📌')} {item.get('label', k)}"
+            if source:
+                label = f"{label} · {source}"
+            value = item.get("value", np.nan)
+            delta = item.get("delta", np.nan)
+            if k == "환율":
+                rate = item.get("rate", 0.0)
+                sign = "▲" if delta > 0 else ("▼" if delta < 0 else "━")
+                value_str = f"{value:,.1f}원"
+                delta_str = f"{sign} {abs(delta):,.1f}원 ({rate:+.2f}%)"
+            elif k == "VIX":
+                zscore = item.get("zscore", 0.0)
+                sign = "▲" if delta > 0 else ("▼" if delta < 0 else "━")
+                value_str = f"{value:,.2f}"
+                delta_str = f"{sign} {abs(delta):,.2f} · Z {zscore:+.2f}"
+            elif k in ["KOSPI", "KOSDAQ"]:
+                rate = item.get("rate", 0.0)
+                sign = "▲" if delta > 0 else ("▼" if delta < 0 else "━")
+                value_str = f"{value:,.2f}"
+                delta_str = f"{sign} {abs(delta):,.2f}p ({rate:+.2f}%)"
+            else:
+                unit = item.get("unit", "")
+                sign = "▲" if delta > 0 else ("▼" if delta < 0 else "━")
+                value_str = f"{value:,.2f}{unit}"
+                delta_str = f"{sign} {abs(delta):,.2f}{unit}"
+            col.markdown(
+                kpi_card(label, value_str, delta_str, card="macro", help_txt=help_map.get(k, "")),
+                unsafe_allow_html=True,
+            )
 
 # ══════════════════════════════════════════════════════════
 #  KPI 패널 3: DART 재무지표
@@ -781,6 +1271,26 @@ st.download_button("⬇️ 예측 결과 CSV 다운로드", data=csv,
                    file_name=f"{code}_{sel_name}_{datetime.today().strftime('%Y%m%d')}.csv",
                    mime="text/csv", use_container_width=True)
 
+close_by_date = {idx.strftime('%Y-%m-%d'): int(value) for idx, value in df['close'].items()}
+metrics = {"rmse": rmse, "mae": mae, "mape": mape, "direction_accuracy": da}
+model_settings = {"lookback": lookback, "pred_days": pred_days, "epochs": epochs, "batch": batch_sz}
+sheet_title = _sheet_safe_title(f"LSTM_{sel_name}_{code}_주가예측")
+prediction_rows = build_prediction_sheet_rows(
+    pred_df, sel_name, code, df.index[-1].strftime('%Y-%m-%d'), close_by_date, metrics, model_settings, FEATURES
+)
+
+if auto_save_sheets or save_sheets_now:
+    try:
+        sheet_url, saved_count, refreshed_count, created_sheet = save_prediction_to_google_sheets(sheet_title, prediction_rows, code, close_by_date)
+        action = "생성" if created_sheet else "갱신"
+        st.success(f"Google Sheets {action} 완료: 예측 {saved_count}행 저장, 실제 종가 {refreshed_count}행 갱신")
+        st.link_button("Google Sheets 열기", sheet_url, use_container_width=True)
+    except GoogleSheetsConfigError as e:
+        st.warning(str(e))
+    except Exception as e:
+        st.error(f"Google Sheets 저장 실패: {e}")
+
+
 # ══════════════════════════════════════════════════════════
 #  피처 설명
 # ══════════════════════════════════════════════════════════
@@ -793,6 +1303,7 @@ desc_map = {
     '환율변화':   ('🟣 거시', 'USD/KRW 일변화율 — 외국인 수급 선행'),
     'VIX정규화':  ('🟣 거시', 'VIX 정규화 — 글로벌 리스크'),
     'KOSPI수익률':('🟣 거시', 'KOSPI 수익률 — 시장 전체 흐름'),
+    'KOSDAQ수익률':('🟣 거시', 'KOSDAQ 수익률 — 성장주/중소형주 분위기'),
     '영업이익률':  ('🟢 DART', '영업이익률 — 기업 수익성 (공시 60일 지연)'),
     'YoY매출성장': ('🟢 DART', 'YoY 매출성장률 — 4분기 대비 성장세'),
 }
