@@ -252,9 +252,12 @@ def _sheet_safe_title(value, max_len=80):
 
 
 def _number_or_blank(value, digits=None):
-    if value is None or pd.isna(value):
+    if value is None or value == "" or pd.isna(value):
         return ""
-    num = float(value)
+    try:
+        num = float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return ""
     if digits is not None:
         num = round(num, digits)
     return int(num) if float(num).is_integer() else num
