@@ -27,6 +27,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
+HAS_TF = False
+HAS_TORCH = False
+
 try:
     import tensorflow as tf
     from tensorflow.keras.models import Sequential
@@ -34,11 +37,17 @@ try:
     from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
     HAS_TF = True
 except Exception:
-    HAS_TF = False
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    from torch.utils.data import TensorDataset, DataLoader
+    pass
+
+if not HAS_TF:
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.optim as optim
+        from torch.utils.data import TensorDataset, DataLoader
+        HAS_TORCH = True
+    except Exception:
+        from sklearn.neural_network import MLPRegressor
 
 try:
     import gspread
@@ -51,7 +60,7 @@ SEED = 42
 np.random.seed(SEED)
 if HAS_TF:
     tf.random.set_seed(SEED)
-else:
+elif HAS_TORCH:
     torch.manual_seed(SEED)
 APP_DIR = Path(__file__).resolve().parent
 WORKSPACE_DIR = APP_DIR.parents[1]
@@ -876,6 +885,32 @@ class PyTorchLSTMWrapper:
             return preds.numpy()
 
 
+class SklearnMLPWrapper:
+    def __init__(self, seq_len, n_feat):
+        from sklearn.neural_network import MLPRegressor
+        self.model = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=100, random_state=42)
+        self.history = {'loss': [], 'val_loss': []}
+
+    def fit(self, X_train, y_train, epochs=100, batch_size=32, validation_data=None, callbacks=None, verbose=0):
+        X_flat = X_train.reshape(len(X_train), -1)
+        self.model.fit(X_flat, y_train)
+        loss = getattr(self.model, 'loss_', 0.01)
+        self.history['loss'] = [loss]
+        self.history['val_loss'] = [loss]
+        if callbacks:
+            for cb in callbacks:
+                if hasattr(cb, 'on_epoch_end'):
+                    try:
+                        cb.on_epoch_end(0, {'loss': loss, 'val_loss': loss})
+                    except Exception:
+                        pass
+        return type('History', (), {'history': self.history})()
+
+    def predict(self, X, verbose=0):
+        X_flat = X.reshape(len(X), -1)
+        return self.model.predict(X_flat).reshape(-1, 1)
+
+
 def build_model(seq_len, n_feat):
     if HAS_TF:
         m = Sequential([
@@ -885,8 +920,10 @@ def build_model(seq_len, n_feat):
         ])
         m.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss='mse')
         return m
-    else:
+    elif HAS_TORCH:
         return PyTorchLSTMWrapper(seq_len, n_feat)
+    else:
+        return SklearnMLPWrapper(seq_len, n_feat)
 
 
 # ══════════════════════════════════════════════════════════
