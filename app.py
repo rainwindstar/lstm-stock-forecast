@@ -27,10 +27,18 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional
+    from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+    HAS_TF = True
+except Exception:
+    HAS_TF = False
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import TensorDataset, DataLoader
 
 try:
     import gspread
@@ -41,10 +49,14 @@ except Exception:
 
 SEED = 42
 np.random.seed(SEED)
-tf.random.set_seed(SEED)
+if HAS_TF:
+    tf.random.set_seed(SEED)
+else:
+    torch.manual_seed(SEED)
 APP_DIR = Path(__file__).resolve().parent
 WORKSPACE_DIR = APP_DIR.parents[1]
 LOCAL_CORPCODE_XML = APP_DIR / "CORPCODE.xml"
+LOCAL_STOCK_LIST_CSV = APP_DIR / "stock_list.csv"
 LOCAL_ENV_PATHS = [
     APP_DIR / ".env",
     WORKSPACE_DIR / ".env",
@@ -193,14 +205,18 @@ html, body, [class*="css"], .stApp, .stMarkdown, .stDataFrame, .stSelectbox, .st
 
 /* ── 피처 뱃지 ───────────────────── */
 .badge {
-    display: inline-block;
+    display: inline-block !important;
     background: #1e3a5f; color: #93c5fd;
-    border-radius: 20px; padding: 3px 10px;
-    font-size: 11px; margin: 2px 2px;
-    border: 1px solid #2d5a9e;
+    border-radius: 20px !important; padding: 4px 12px !important;
+    font-size: 11px !important; margin: 3px 3px !important;
+    border: 1px solid #2d5a9e !important;
+    border-left: 1px solid #2d5a9e !important;
+    min-height: auto !important;
+    line-height: 1.4 !important;
+    vertical-align: middle !important;
 }
-.badge.macro { background: #1e1b4b; color: #a5b4fc; border-color: #4338ca; }
-.badge.dart  { background: #052e16; color: #6ee7b7; border-color: #065f46; }
+.badge.macro { background: #1e1b4b !important; color: #a5b4fc !important; border-color: #4338ca !important; border-left: 1px solid #4338ca !important; min-height: auto !important; padding: 4px 12px !important; }
+.badge.dart  { background: #052e16 !important; color: #6ee7b7 !important; border-color: #065f46 !important; border-left: 1px solid #065f46 !important; min-height: auto !important; padding: 4px 12px !important; }
 
 /* ── 구분선 ──────────────────────── */
 hr { border-color: #2a3a50 !important; margin: 16px 0 !important; }
@@ -428,7 +444,15 @@ def parse_corpcode_xml(xml_bytes):
 def load_stock_list(dart_api_key):
     frames = []
     try:
-        if dart_api_key:
+        if LOCAL_STOCK_LIST_CSV.exists():
+            stock_df = pd.read_csv(LOCAL_STOCK_LIST_CSV, dtype={'종목코드': str, 'corp_code': str})
+            stock_df['종목코드'] = stock_df['종목코드'].str.zfill(6)
+            frames.append(stock_df)
+    except Exception:
+        pass
+
+    try:
+        if not frames and dart_api_key:
             resp = requests.get(
                 "https://opendart.fss.or.kr/api/corpCode.xml",
                 params={"crtfc_key": dart_api_key},
@@ -437,14 +461,14 @@ def load_stock_list(dart_api_key):
             resp.raise_for_status()
             with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
                 frames.append(parse_corpcode_xml(zf.read(zf.namelist()[0])))
-    except Exception as e:
-        st.warning(f"DART 종목 목록 갱신 실패 → 로컬/대체 목록 사용 ({e})")
+    except Exception:
+        pass
 
     try:
         if not frames and LOCAL_CORPCODE_XML.exists():
             frames.append(parse_corpcode_xml(LOCAL_CORPCODE_XML.read_bytes()))
-    except Exception as e:
-        st.warning(f"로컬 CORPCODE.xml 로딩 실패 → KRX 대체 ({e})")
+    except Exception:
+        pass
 
     try:
         if not frames:
@@ -452,8 +476,8 @@ def load_stock_list(dart_api_key):
             krx.columns = ['종목코드','회사명']
             krx['corp_code'] = ''
             frames.append(krx[['회사명','종목코드','corp_code']])
-    except Exception as e:
-        st.warning(f"KRX 목록 실패 → 기본 종목만 사용 ({e})")
+    except Exception:
+        pass
 
     frames.append(DEFAULT_STOCKS)
     return (
@@ -759,14 +783,110 @@ def make_sequences(data, seq_len):
     return np.array(X), np.array(y)
 
 
+class PyTorchLSTMWrapper:
+    class PyTorchLSTMModel(nn.Module):
+        def __init__(self, seq_len, n_feat):
+            super().__init__()
+            self.lstm1 = nn.LSTM(n_feat, 64, batch_first=True, bidirectional=True)
+            self.dropout1 = nn.Dropout(0.2)
+            self.lstm2 = nn.LSTM(128, 32, batch_first=True, bidirectional=True)
+            self.dropout2 = nn.Dropout(0.2)
+            self.fc1 = nn.Linear(64, 16)
+            self.relu = nn.ReLU()
+            self.fc2 = nn.Linear(16, 1)
+
+        def forward(self, x):
+            out, _ = self.lstm1(x)
+            out = self.dropout1(out)
+            out, _ = self.lstm2(out)
+            out = self.dropout2(out[:, -1, :])
+            out = self.relu(self.fc1(out))
+            out = self.fc2(out)
+            return out
+
+    def __init__(self, seq_len, n_feat):
+        self.seq_len = seq_len
+        self.n_feat = n_feat
+        self.model = self.PyTorchLSTMModel(seq_len, n_feat)
+        self.history = {'loss': [], 'val_loss': []}
+
+    def fit(self, X_train, y_train, epochs=100, batch_size=32, validation_data=None, callbacks=None, verbose=0):
+        criterion = nn.MSELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
+        
+        X_tensor = torch.tensor(X_train, dtype=torch.float32)
+        y_tensor = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
+        dataset = TensorDataset(X_tensor, y_tensor)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        
+        has_val = validation_data is not None
+        if has_val:
+            X_val_t = torch.tensor(validation_data[0], dtype=torch.float32)
+            y_val_t = torch.tensor(validation_data[1], dtype=torch.float32).unsqueeze(1)
+
+        best_loss = float('inf')
+        patience = 15
+        patience_counter = 0
+
+        for epoch in range(epochs):
+            self.model.train()
+            train_loss = 0.0
+            for batch_x, batch_y in loader:
+                optimizer.zero_grad()
+                outputs = self.model(batch_x)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item() * len(batch_x)
+            train_loss /= len(X_train)
+            self.history['loss'].append(train_loss)
+
+            val_loss = 0.0
+            if has_val:
+                self.model.eval()
+                with torch.no_grad():
+                    val_outputs = self.model(X_val_t)
+                    val_loss = criterion(val_outputs, y_val_t).item()
+                self.history['val_loss'].append(val_loss)
+
+            if callbacks:
+                logs = {'loss': train_loss, 'val_loss': val_loss}
+                for cb in callbacks:
+                    if hasattr(cb, 'on_epoch_end'):
+                        try:
+                            cb.on_epoch_end(epoch, logs)
+                        except Exception:
+                            pass
+
+            if has_val:
+                if val_loss < best_loss:
+                    best_loss = val_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        break
+        return type('History', (), {'history': self.history})()
+
+    def predict(self, X, verbose=0):
+        self.model.eval()
+        with torch.no_grad():
+            X_tensor = torch.tensor(X, dtype=torch.float32)
+            preds = self.model(X_tensor)
+            return preds.numpy()
+
+
 def build_model(seq_len, n_feat):
-    m = Sequential([
-        Bidirectional(LSTM(64, return_sequences=True), input_shape=(seq_len, n_feat)),
-        Dropout(0.2), Bidirectional(LSTM(32)), Dropout(0.2),
-        Dense(16, activation='relu'), Dense(1),
-    ])
-    m.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss='mse')
-    return m
+    if HAS_TF:
+        m = Sequential([
+            Bidirectional(LSTM(64, return_sequences=True), input_shape=(seq_len, n_feat)),
+            Dropout(0.2), Bidirectional(LSTM(32)), Dropout(0.2),
+            Dense(16, activation='relu'), Dense(1),
+        ])
+        m.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss='mse')
+        return m
+    else:
+        return PyTorchLSTMWrapper(seq_len, n_feat)
 
 
 # ══════════════════════════════════════════════════════════
@@ -1137,19 +1257,30 @@ bar = st.progress(0, text="모델 초기화 중...")
 with st.spinner("학습 중..."):
     model = build_model(lookback, len(FEATURES))
 
-    class _CB(tf.keras.callbacks.Callback):
-        def on_epoch_end(self, ep, logs=None):
-            pct = min(int((ep+1)/epochs*100), 100)
-            bar.progress(pct, text=f"에포크 {ep+1}/{epochs}  |  val_loss: {logs.get('val_loss',0):.6f}")
+    if HAS_TF:
+        class _CB(tf.keras.callbacks.Callback):
+            def on_epoch_end(self, ep, logs=None):
+                pct = min(int((ep+1)/epochs*100), 100)
+                bar.progress(pct, text=f"에포크 {ep+1}/{epochs}  |  val_loss: {logs.get('val_loss',0):.6f}")
+
+        callbacks = [
+            EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True, verbose=0),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=7, min_lr=1e-6, verbose=0),
+            _CB(),
+        ]
+    else:
+        class _CB:
+            def on_epoch_end(self, ep, logs=None):
+                logs = logs or {}
+                pct = min(int((ep+1)/epochs*100), 100)
+                bar.progress(pct, text=f"에포크 {ep+1}/{epochs}  |  val_loss: {logs.get('val_loss',0):.6f}")
+
+        callbacks = [_CB()]
 
     history = model.fit(
         X_tr, y_tr, validation_data=(X_v, y_v),
         epochs=epochs, batch_size=batch_sz,
-        callbacks=[
-            EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True, verbose=0),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=7, min_lr=1e-6, verbose=0),
-            _CB(),
-        ], verbose=0)
+        callbacks=callbacks, verbose=0)
 
 ae = len(history.history['loss'])
 bar.progress(100, text=f"✅ 학습 완료  {ae}/{epochs} 에포크 (EarlyStopping 적용)")
