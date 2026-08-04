@@ -983,8 +983,8 @@ with col_q:
                           placeholder="종목명 또는 코드 입력...")
     direct_code = st.text_input("종목코드 직접 입력", value="", placeholder="예: 005930")
 matched = stock_df[
-    stock_df['회사명'].str.contains(query, na=False) |
-    stock_df['종목코드'].str.contains(query, na=False)
+    stock_df['회사명'].str.contains(query, na=False, case=False, regex=False) |
+    stock_df['종목코드'].str.contains(query, na=False, regex=False)
 ].head(50)
 
 if matched.empty:
