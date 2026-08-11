@@ -1,0 +1,39 @@
+name: KOSPI Kakao Scanner
+
+on:
+  schedule:
+    - cron: "0 7 * * 1-5"
+      timezone: "Asia/Seoul"
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: "휴장일에도 테스트 실행"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: kospi-kakao-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: kospi_kakao_scanner/requirements.txt
+      - name: Install dependencies
+        run: pip install -r kospi_kakao_scanner/requirements.txt
+      - name: Run scanner
+        env:
+          KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
+          KAKAO_CLIENT_SECRET: ${{ secrets.KAKAO_CLIENT_SECRET }}
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+          KAKAO_LINK_URL: ${{ vars.KAKAO_LINK_URL }}
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force_run || 'false' }}
+        run: python kospi_kakao_scanner/scanner.py
