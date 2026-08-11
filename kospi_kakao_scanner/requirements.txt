@@ -1,0 +1,4 @@
+finance-datareader
+pandas>=2.2,<4
+requests>=2.32,<3
+exchange-calendars>=4.11.3,<5
