@@ -22,20 +22,31 @@ python -m pip install -r requirements.txt
 python -m streamlit run app.py
 ```
 
-카톡 공유용 공개 주소까지 만들려면 Windows에서:
+카톡 공유용 공개 주소까지 만들려면 Windows에서 먼저 Cloudflare CLI를 설치하고 새 터미널을 여세요:
+
+```powershell
+winget install --id Cloudflare.cloudflared -e
+```
+
+그런 다음 실행합니다:
 
 ```bash
 publish_kakao.bat
 ```
 
-실행 후 콘솔에 표시되는 `https://...trycloudflare.com` 주소를 카톡에 공유합니다. 같은 주소는 `public_url.txt`에도 저장되고 클립보드에도 복사됩니다. 공유 중에는 콘솔 창을 닫지 마세요.
+실행 후 콘솔에 표시되는 `https://...trycloudflare.com` 주소를 카톡에 공유합니다. 같은 주소는 `public_url.txt`에도 저장되고 클립보드에도 복사됩니다. 공유 중에는 콘솔 창을 닫지 마세요. 종료는 `Ctrl+C`이며 서버와 터널을 정리하고 만료된 `public_url.txt`를 삭제합니다. 기본 포트는 8502이며 `STREAMLIT_PORT`로 변경할 수 있습니다. 이미 사용 중인 포트는 오류로 알리고 기존 프로세스를 종료하지 않습니다.
 
-ngrok을 사용하려면:
+ngrok을 사용하려면 ngrok 계정의 인증 토큰을 환경변수로 설정합니다 (Windows cmd):
+```bat
+set NGROK_AUTHTOKEN=발급받은_ngrok_토큰
+```
+
+실행:
 ```bash
 python start_share.py
 ```
 
-`start_share.py`는 기본적으로 로컬 서버를 열고, `NGROK_AUTHTOKEN` 또는 `NGROK_TOKEN` 환경변수가 있으면 외부 공유 주소까지 생성합니다.
+`start_share.py`는 기본적으로 로컬 서버를 열고, `NGROK_AUTHTOKEN` 또는 `NGROK_TOKEN` 환경변수가 있으면 HTTPS 외부 공유 주소를 생성하고 동일하게 `public_url.txt` 저장·Windows 클립보드 복사를 수행합니다. `pyngrok`는 `requirements.txt`에 포함됩니다. Cloudflare는 계정 토큰 없이 임시 URL을 생성하며 실행할 때마다 주소가 바뀔 수 있습니다.
 
 ## 선택 설정
 DART 재무 피처를 사용하려면 환경변수를 설정합니다.
