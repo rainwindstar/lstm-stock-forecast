@@ -6,3 +6,5 @@ CORPCODE.xml
 *.egg-info/
 .env
 .streamlit/secrets.toml
+
+public_url.txt

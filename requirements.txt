@@ -11,3 +11,5 @@ psutil>=5.9
 koreanize-matplotlib>=0.1.1
 gspread>=6.0
 google-auth>=2.29
+
+pyngrok>=7.0,<8
